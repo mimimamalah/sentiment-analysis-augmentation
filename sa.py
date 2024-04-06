@@ -18,7 +18,7 @@ class SADataset(Dataset):
     Implement SADataset in Pytorch
     """
     def __init__(self, data_repo, tokenizer, sent_max_length=128):
-        
+        # Here don't forget positive equals 0 and negative equals 1
         self.label_to_id = {"positive": 0, "negative": 1}
         self.id_to_label = {0: "positive", 1: "negative"}
         
@@ -28,8 +28,8 @@ class SADataset(Dataset):
         # TODO: Get the special token and token id for PAD from defined tokenizer (self.tokenizer).  #
         ##############################################################################################
         
-        self.pad_token = ...
-        self.pad_id = ...
+        self.pad_token = self.tokenizer.pad_token
+        self.pad_id = self.tokenizer.pad_token_id
         
         ############################################################################
         #                               END OF YOUR CODE                           #
@@ -51,8 +51,15 @@ class SADataset(Dataset):
                 #     - set label id to None if no label is available.                        #
                 ###############################################################################
 
-                input_ids = ...
-                label_id = ...
+                # On Ed : sent_max_length for truncating tokens does not include the special tokens
+                # later added to the RoBERTa model input format
+                input_ids = self.tokenizer.encode(sample["review"], 
+                                   add_special_tokens=True, 
+                                   max_length=sent_max_length+2, 
+                                   truncation=True,
+                                   padding='max_length')
+                label_id = self.label_to_id.get(sample.get("label"), None)
+
                 
                 ############################################################################
                 #                               END OF YOUR CODE                           #
@@ -80,8 +87,9 @@ class SADataset(Dataset):
         ##############################################################################################
         # TODO: if max_length < 0, pad to the length of the longest input sample in the batch        #
         ##############################################################################################
-        
-        pad_inputs = ...
+        if max_length < 0:
+          max_length = max(len(input) for input in inputs)
+        pad_inputs = [input + [self.pad_id] * (max_length - len(input)) for input in inputs]
         
         ############################################################################
         #                               END OF YOUR CODE                           #
@@ -104,9 +112,13 @@ class SADataset(Dataset):
         # TODO: implement collate_fn for batchify input into preferable format.                     #
         ##############################################################################################
 
-        tensor_batch_ids = ...
-        tensor_labels = ...
-        
+        batch_ids = [item["ids"] for item in batch]
+        batch_labels = [item["label"] for item in batch]
+
+        max_length = max(len(ids) for ids in batch_ids)
+        tensor_batch_ids = torch.tensor(self.padding(batch_ids, max_length))
+        tensor_labels = torch.tensor(batch_labels)
+                
         ############################################################################
         #                               END OF YOUR CODE                           #
         ############################################################################
@@ -129,7 +141,7 @@ class SADataset(Dataset):
         # TODO: implement class decoding function, return "unknown" for unknown class id prediction. #
         ##############################################################################################
         
-        label_name_list = ...
+        label_name_list = [self.id_to_label.get(id, "unknown") for id in class_ids]
 
         ############################################################################
         #                               END OF YOUR CODE                           #
@@ -153,9 +165,28 @@ def compute_metrics(predictions, gold_labels):
     # TODO: Implement metrics computation.                                       #
     ##############################################################################
 
-    confusion_matrix = ...
-    f1_positive = ...
-    f1_negative = ...
+    TP, FP, FN, TN = 0, 0, 0, 0
+    
+    # Remember: 0 represents positive class, 1 represents negative class
+    for pred, gold in zip(predictions, gold_labels):
+        if pred == gold == 0: 
+            TP += 1
+        elif pred == gold == 1: 
+            TN += 1
+        elif pred == 0 and gold == 1:
+            FP += 1
+        elif pred == 1 and gold == 0: 
+            FN += 1
+            
+    confusion_matrix = np.array([[TP, FN], [FP, TN]])
+    
+    precision_pos = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall_pos = TP / (TP + FN) if (TP + FN) > 0 else 0
+    f1_positive = 2 * (precision_pos * recall_pos) / (precision_pos + recall_pos) if (precision_pos + recall_pos) > 0 else 0
+    
+    precision_neg = TN / (TN + FN) if (TN + FN) > 0 else 0
+    recall_neg = TN / (TN + FP) if (TN + FP) > 0 else 0
+    f1_negative = 2 * (precision_neg * recall_neg) / (precision_neg + recall_neg) if (precision_neg + recall_neg) > 0 else 0
 
     ##############################################################################
     #                              END OF YOUR CODE                              #
@@ -199,12 +230,12 @@ def train(train_dataset, dev_dataset, model, device, batch_size, epochs,
     # Replace "..." statement with your code
     
     # calculate total training steps
-    total_steps = ...
-    warmup_steps = ...
+    total_steps = len(train_dataloader) * epochs
+    warmup_steps = int(warmup_percent * total_steps)
     
     # set up AdamW optimizer and constant learning rate scheduleer with warmup
-    optimizer = ...
-    scheduler = ...
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
     
     ##############################################################################
     #                              END OF YOUR CODE                              #
@@ -230,7 +261,7 @@ def train(train_dataset, dev_dataset, model, device, batch_size, epochs,
         for i, batch in enumerate(tqdm(train_dataloader, desc="Training")):
             
             # clear the gradients of all optimized parameters
-            ...
+            optimizer.zero_grad()
 
             epoch_train_step += 1
             total_train_step += 1
@@ -239,14 +270,14 @@ def train(train_dataset, dev_dataset, model, device, batch_size, epochs,
             input_ids, labels = batch_tuple
 
             # get model's single-batch outputs and loss
-            outputs = ...
-            loss = ...
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
             
             # conduct back-proporgation
-            ...
+            loss.backward()
 
             # truncate gradient to max_grad_norm
-            ...
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
             train_loss_accum += loss.mean().item()
             
@@ -257,7 +288,8 @@ def train(train_dataset, dev_dataset, model, device, batch_size, epochs,
                 running_loss = 0.0
 
             # step forward optimizer and scheduler
-            ...
+            optimizer.step()
+            scheduler.step()
 
         ##############################################################################
         #                              END OF YOUR CODE                              #
@@ -281,7 +313,11 @@ def train(train_dataset, dev_dataset, model, device, batch_size, epochs,
         ##############################################################################################################
         # Replace "..." statement with your code
         if macro_f1 > best_dev_macro_f1:
-            ...
+            best_dev_macro_f1 = macro_f1
+    
+            model.save_pretrained(save_repo)
+          
+            train_dataset.tokenizer.save_pretrained(save_repo)
             print("Model Saved!")
         
         ##############################################################################
@@ -332,11 +368,11 @@ def evaluate(eval_dataset, model, device, batch_size, use_labels=True, result_sa
             #####################################################
             # Replace "..." statement with your code
             if use_labels:
-                outputs = ...
+                outputs = model(input_ids, labels=labels)
             else:
-                outputs = ...
-            loss = ...
-            logits = ...
+                outputs =  model(input_ids)
+            loss = outputs[0]
+            logits = outputs[1]
 
             #######################################################
             #                    END OF YOUR CODE                 #
@@ -351,7 +387,7 @@ def evaluate(eval_dataset, model, device, batch_size, use_labels=True, result_sa
     #          TODO: get model predicted labels.        # 
     #####################################################
     # Replace "..." statement with your code
-    pred_labels = ...
+    pred_labels = np.argmax(np.concatenate(batch_preds, axis=0), axis=1)
 
     #####################################################
     #                   END OF YOUR CODE                #
